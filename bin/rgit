@@ -389,10 +389,6 @@ collect_repos() {
     fi
 
     # Ignore git submodules.
-    #
-    # Submodules commonly have a .git file instead of a .git directory,
-    # so the find command discovers them. We skip them here so that list,
-    # update, status and branch-status do not treat them as independent repos.
     if is_submodule_repo "$repo"; then
       log_verbose "$repo: skipping submodule"
       SEEN_REPOS+=("$repo_abs")
@@ -402,8 +398,10 @@ collect_repos() {
     SEEN_REPOS+=("$repo_abs")
     REPOS+=("$repo")
   done < <(
-    find "${ROOTS[@]}" \
+    find "${ROOTS[@]}" -mindepth 1 \
       \( -type d -name .git -prune -print0 \) \
+      -o \
+      \( -type d -name '.?*' -prune \) \
       -o \
       \( -type f -name .git -print0 \) \
       2>/dev/null
