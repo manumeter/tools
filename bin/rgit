@@ -1,0 +1,1009 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+SEEN_REPOS=()
+REPOS=()
+
+VERBOSE=0
+JOBS=8
+TIMEOUT=60
+TIMEOUT_BIN=""
+PRINT_LOCK_DIR=""
+COLOR_ENABLED=0
+C_RESET=""
+C_BOLD=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_CYAN=""
+
+print_help() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME [options] <command> [dir1 [dir2 [...]]]
+
+  Recursively searches all git repos under the given dir(s), or "." if no dir
+  is given, and runs the given command on them.
+
+  Git submodules are ignored by all commands. They are considered part of
+  their parent repository.
+
+Options:
+  -v, --verbose
+    Print progress information to stderr.
+    Useful to see where update/up is hanging.
+
+  -j, --jobs N
+    Process up to N repositories in parallel.
+    Default: $JOBS
+
+  -t --timeout SECONDS
+    Timeout for git fetch and origin/HEAD detection during update/up.
+    Default: $TIMEOUT seconds.
+    Requires "timeout" or "gtimeout" to be installed. If neither exists,
+    the timeout cannot be enforced.
+
+  -h, --help
+    Show this help.
+
+Commands:
+  list, ls
+    List all repos as git clone commands.
+    This can be used to recreate the same repo directory structure.
+
+  update, up
+    Fetch origin, including all remote branches, and safely fast-forward
+    local branches where possible.
+    Already up-to-date repos produce no output.
+    Problems such as fetch failures, local commits, diverged branches or local
+    changes preventing a fast-forward are reported.
+
+  status, st
+    Print the following status infos:
+      - local uncommitted changes
+      - untracked files/directories
+      - local branches not present on origin
+      - local branches that differ from origin
+    Clean repos produce no output.
+    Does not fetch; it compares against currently known origin/* refs.
+
+  branch-status, bs
+    Print a brief summary of the differences between the default origin branch
+    and all other known origin branches.
+    Repos with no differences between origin branches produce no output.
+    Does not fetch; run update/up first if you want fresh origin refs.
+
+  diff, df
+    Print local staged and unstaged diffs.
+    Repos without local diffs produce no output.
+    Untracked files are not shown here; use status/st for those.
+
+  branch-diff, bd
+    Print the full diffs between the default origin branch and all other known
+    origin branches that have file differences.
+    Repos with no differences between origin branches produce no output.
+    Does not fetch; run update/up first if you want fresh origin refs.
+
+Examples:
+   $SCRIPT_NAME ls ~/all-repos > ~/git-repos-\$(date +%F).sh
+   $SCRIPT_NAME up
+   $SCRIPT_NAME -v up
+   $SCRIPT_NAME -j 8 --fetch-timeout 30 up repos/*
+   $SCRIPT_NAME st
+   $SCRIPT_NAME bs repos/app-* repos/cluster-app-*
+EOF
+}
+
+log_verbose() {
+  (( VERBOSE == 1 )) || return 0
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+}
+
+init_colors() {
+  local colorbool
+
+  [[ -t 1 ]] || return 0
+  [[ -z "${NO_COLOR:-}" ]] || return 0
+  [[ "${TERM:-}" != "dumb" ]] || return 0
+
+  colorbool="$(git config --get-colorbool color.ui true 2>/dev/null || printf 'false')"
+  [[ "$colorbool" == "true" ]] || return 0
+
+  COLOR_ENABLED=1
+  C_RESET=$'\033[m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+}
+
+color_text() {
+  local color="$1"
+  local text="$2"
+
+  if (( COLOR_ENABLED == 1 )); then
+    printf '%s%s%s' "$color" "$text" "$C_RESET"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+label_line() {
+  local label="$1"
+  local color="$2"
+  local text="$3"
+
+  if (( COLOR_ENABLED == 1 )); then
+    printf '%s%s%s: %s' "$color" "$label" "$C_RESET" "$text"
+  else
+    printf '%s: %s' "$label" "$text"
+  fi
+}
+
+indented_label_line() {
+  local label="$1"
+  local color="$2"
+  local text="$3"
+
+  if (( COLOR_ENABLED == 1 )); then
+    printf '  %s%s%s: %s' "$color" "$label" "$C_RESET" "$text"
+  else
+    printf '  %s: %s' "$label" "$text"
+  fi
+}
+
+branch_status_line() {
+  local default_ref="$1"
+  local branch="$2"
+  local default_ahead="$3"
+  local branch_ahead="$4"
+  local tree_note="$5"
+
+  if (( COLOR_ENABLED == 1 )); then
+    local tree_color="$C_RED"
+    [[ "$tree_note" == "same files" ]] && tree_color="$C_GREEN"
+
+    printf '%sBRANCH%s: ' "$C_YELLOW" "$C_RESET"
+    printf '%s%s%s ' "$C_CYAN" "$default_ref" "$C_RESET"
+    printf '%s!=%s %s ' "$C_RED" "$C_RESET" "$branch"
+    printf '%s-%s%s %s+%s%s ' "$C_RED" "$default_ahead" "$C_RESET" "$C_GREEN" "$branch_ahead" "$C_RESET"
+    printf '(%s%s%s)' "$tree_color" "$tree_note" "$C_RESET"
+  else
+    printf 'BRANCH: %s != %s; %s +%s, %s +%s; %s' \
+      "$default_ref" "$branch" "$default_ref" "$default_ahead" "$branch" "$branch_ahead" "$tree_note"
+  fi
+}
+
+parse_options() {
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        print_help
+        exit 0
+        ;;
+      -v|--verbose)
+        VERBOSE=1
+        shift
+        ;;
+      -j|--jobs)
+        if (( $# < 2 )); then
+          echo "Missing value for $1" >&2
+          exit 2
+        fi
+        JOBS="$2"
+        shift 2
+        ;;
+      -t|--timeout)
+        if (( $# < 2 )); then
+          echo "Missing value for $1" >&2
+          exit 2
+        fi
+        TIMEOUT="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        echo >&2
+        print_help >&2
+        exit 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  REMAINING_ARGS=("$@")
+}
+
+REMAINING_ARGS=()
+parse_options "$@"
+set -- "${REMAINING_ARGS[@]}"
+
+if (( $# == 0 )); then
+  print_help
+  exit 0
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  list|ls)
+    COMMAND="list"
+    ;;
+  update|up)
+    COMMAND="update"
+    ;;
+  status|st)
+    COMMAND="status"
+    ;;
+  branch-status|bs)
+    COMMAND="branch-status"
+    ;;
+  diff|df)
+    COMMAND="diff"
+    ;;
+  branch-diff|bd)
+    COMMAND="branch-diff"
+    ;;
+  *)
+    echo "Unknown command: $COMMAND"
+    echo
+    print_help
+    exit 2
+    ;;
+esac
+
+# Allow options after the command as well:
+#   script up -v -j 4 repos/*
+REMAINING_ARGS=()
+parse_options "$@"
+set -- "${REMAINING_ARGS[@]}"
+
+if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || (( JOBS < 1 )); then
+  echo "Invalid --jobs value: $JOBS" >&2
+  exit 2
+fi
+
+if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --fetch-timeout value: $TIMEOUT" >&2
+  exit 2
+fi
+
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+fi
+
+if (( $# == 0 )); then
+  ROOTS=(".")
+else
+  ROOTS=("$@")
+fi
+
+init_colors
+
+# If a root is inside a git repo, resolve it to the repo's top-level so that
+# rgit can be invoked from any subdirectory, the same way git itself works.
+for i in "${!ROOTS[@]}"; do
+  _toplevel="$(git -C "${ROOTS[$i]}" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$_toplevel" ]]; then
+    ROOTS[$i]="$_toplevel"
+  fi
+done
+unset _toplevel
+
+# Bash-3-compatible de-duplication.
+SEEN_REPOS=()
+REPOS=()
+
+repo_seen() {
+  local needle="$1"
+  local seen
+
+  for seen in "${SEEN_REPOS[@]}"; do
+    [[ "$seen" == "$needle" ]] && return 0
+  done
+
+  return 1
+}
+
+print_block_unlocked() {
+  local repo="$1"
+  shift
+
+  (( $# == 0 )) && return
+
+  printf '\n%s\n' "$(color_text "${C_BOLD}${C_CYAN}" "$repo")"
+
+  local line
+  for line in "$@"; do
+    printf '  %s\n' "$line"
+  done
+}
+
+print_block() {
+  local lock_acquired=0
+
+  # When running in parallel, avoid interleaving one repo's output with another.
+  # Uses mkdir as a portable lock mechanism.
+  if [[ -n "${PRINT_LOCK_DIR:-}" ]]; then
+    while ! mkdir "$PRINT_LOCK_DIR/print.lock" 2>/dev/null; do
+      sleep 0.05
+    done
+    lock_acquired=1
+  fi
+
+  print_block_unlocked "$@"
+
+  if (( lock_acquired == 1 )); then
+    rmdir "$PRINT_LOCK_DIR/print.lock" 2>/dev/null || true
+  fi
+}
+
+is_submodule_repo() {
+  local repo="$1"
+  local superproject=""
+
+  superproject="$(
+    git -C "$repo" rev-parse --show-superproject-working-tree 2>/dev/null || true
+  )"
+
+  [[ -n "$superproject" ]]
+}
+
+find_repo_root_from_git_path() {
+  local gitpath="$1"
+
+  if [[ -d "$gitpath" ]]; then
+    local repo="${gitpath%/.git}"
+    [[ -z "$repo" ]] && repo="."
+    printf '%s\n' "$repo"
+  else
+    dirname "$gitpath"
+  fi
+}
+
+collect_repos() {
+  local gitpath repo repo_abs
+
+  while IFS= read -r -d '' gitpath; do
+    repo="$(find_repo_root_from_git_path "$gitpath")"
+
+    if repo_abs="$(cd "$repo" 2>/dev/null && pwd -P)"; then
+      :
+    else
+      continue
+    fi
+
+    if repo_seen "$repo_abs"; then
+      continue
+    fi
+
+    # Ignore git submodules.
+    #
+    # Submodules commonly have a .git file instead of a .git directory,
+    # so the find command discovers them. We skip them here so that list,
+    # update, status and branch-status do not treat them as independent repos.
+    if is_submodule_repo "$repo"; then
+      log_verbose "$repo: skipping submodule"
+      SEEN_REPOS+=("$repo_abs")
+      continue
+    fi
+
+    SEEN_REPOS+=("$repo_abs")
+    REPOS+=("$repo")
+  done < <(
+    find "${ROOTS[@]}" \
+      \( -type d -name .git -prune -print0 \) \
+      -o \
+      \( -type f -name .git -print0 \) \
+      2>/dev/null
+  )
+}
+
+running_jobs_count() {
+  jobs -pr | wc -l | tr -d ' '
+}
+
+for_each_repo() {
+  local callback="$1"
+
+  collect_repos
+
+  if (( JOBS <= 1 )); then
+    local repo
+    for repo in "${REPOS[@]}"; do
+      log_verbose "$repo: start"
+      "$callback" "$repo"
+      log_verbose "$repo: done"
+    done
+    return
+  fi
+
+  PRINT_LOCK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/git-repos.XXXXXX")" || exit 1
+
+  local -a pids=()
+  local repo
+
+  for repo in "${REPOS[@]}"; do
+    while (( $(running_jobs_count) >= JOBS )); do
+      sleep 0.2
+    done
+
+    (
+      log_verbose "$repo: start"
+      "$callback" "$repo"
+      log_verbose "$repo: done"
+    ) &
+
+    pids+=("$!")
+  done
+
+  local rc=0
+  local pid
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+
+  rm -rf "$PRINT_LOCK_DIR"
+  PRINT_LOCK_DIR=""
+
+  return "$rc"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+
+  if (( seconds > 0 )) && [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" "${seconds}s" "$@"
+  else
+    "$@"
+  fi
+}
+
+fetch_origin_quietly() {
+  local repo="$1"
+
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    return 2
+  fi
+
+  if (( TIMEOUT > 0 )) && [[ -z "$TIMEOUT_BIN" ]]; then
+    log_verbose "$repo: no timeout/gtimeout binary found; fetch timeout is not enforced"
+  fi
+
+  log_verbose "$repo: fetching origin"
+
+  run_with_timeout "$TIMEOUT" \
+    env GIT_TERMINAL_PROMPT=0 \
+    git -C "$repo" fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*' \
+    >/dev/null 2>&1
+
+  local rc=$?
+
+  case "$rc" in
+    0)
+      log_verbose "$repo: fetch finished"
+      return 0
+      ;;
+    124|137)
+      log_verbose "$repo: fetch timed out after ${TIMEOUT}s"
+      return 124
+      ;;
+    *)
+      log_verbose "$repo: fetch failed"
+      return "$rc"
+      ;;
+  esac
+}
+
+update_origin_head_quietly() {
+  local repo="$1"
+
+  log_verbose "$repo: updating origin/HEAD"
+
+  run_with_timeout "$TIMEOUT" \
+    env GIT_TERMINAL_PROMPT=0 \
+    git -C "$repo" remote set-head origin --auto \
+    >/dev/null 2>&1
+
+  local rc=$?
+
+  case "$rc" in
+    0)
+      log_verbose "$repo: origin/HEAD updated"
+      return 0
+      ;;
+    124|137)
+      log_verbose "$repo: updating origin/HEAD timed out after ${TIMEOUT}s"
+      return 124
+      ;;
+    *)
+      log_verbose "$repo: could not update origin/HEAD"
+      return "$rc"
+      ;;
+  esac
+}
+
+detect_existing_origin_default_ref() {
+  local repo="$1"
+  local default_branch=""
+
+  default_branch="$(
+    git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null \
+      | sed 's#^origin/##'
+  )"
+
+  if [[ -n "$default_branch" ]] &&
+     git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$default_branch"; then
+    printf 'origin/%s\n' "$default_branch"
+    return 0
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet refs/remotes/origin/main; then
+    printf 'origin/main\n'
+    return 0
+  fi
+
+  if git -C "$repo" show-ref --verify --quiet refs/remotes/origin/master; then
+    printf 'origin/master\n'
+    return 0
+  fi
+
+  return 1
+}
+
+cmd_list_repo() {
+  local repo="$1"
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local origin_url
+  origin_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+
+  if [[ -z "$origin_url" ]]; then
+    printf 'Skipping %s: no origin remote configured\n' "$repo" >&2
+    return
+  fi
+
+  printf 'git clone -- %q %q\n' "$origin_url" "$repo"
+}
+
+cmd_update_repo() {
+  local repo="$1"
+  local -a output_lines=()
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  fetch_origin_quietly "$repo"
+  local fetch_rc=$?
+
+  if (( fetch_rc != 0 )); then
+    case "$fetch_rc" in
+      2) output_lines+=("$(label_line "FETCH" "$C_RED" "no origin remote configured")") ;;
+      124) output_lines+=("$(label_line "FETCH" "$C_RED" "timed out after ${TIMEOUT}s fetching origin")") ;;
+      *) output_lines+=("$(label_line "FETCH" "$C_RED" "cannot fetch from origin")") ;;
+    esac
+
+    print_block "$repo" "${output_lines[@]}"
+    return
+  fi
+
+  # Update origin/HEAD so branch-status can determine the default branch later.
+  # Fully quiet unless -v/--verbose is used. Failures are non-fatal.
+  update_origin_head_quietly "$repo" || true
+
+  local dirty_status
+  dirty_status="$(git -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+
+  local current_branch
+  current_branch="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+  while IFS= read -r branch; do
+    [[ -z "$branch" ]] && continue
+
+    local local_ref="refs/heads/$branch"
+    local origin_ref="refs/remotes/origin/$branch"
+
+    if ! git -C "$repo" show-ref --verify --quiet "$origin_ref"; then
+      continue
+    fi
+
+    local ahead behind
+    read -r ahead behind < <(
+      git -C "$repo" rev-list --left-right --count "$local_ref...$origin_ref" 2>/dev/null \
+        || printf '0 0\n'
+    )
+
+    if (( ahead > 0 && behind > 0 )); then
+      output_lines+=("$(label_line "SKIP" "$C_YELLOW" "branch '$branch' has local commits and is behind origin/$branch; not fast-forwarding")")
+      continue
+    elif (( ahead > 0 )); then
+      output_lines+=("$(label_line "SKIP" "$C_YELLOW" "branch '$branch' has local commits not on origin/$branch; not fast-forwarding")")
+      continue
+    fi
+
+    if (( behind == 0 )); then
+      continue
+    fi
+
+    local old_sha new_sha
+    old_sha="$(git -C "$repo" rev-parse "$local_ref^{commit}" 2>/dev/null || true)"
+    new_sha="$(git -C "$repo" rev-parse "$origin_ref^{commit}" 2>/dev/null || true)"
+
+    [[ -z "$old_sha" || -z "$new_sha" ]] && continue
+
+    if [[ "$branch" == "$current_branch" ]]; then
+      if [[ -n "$dirty_status" ]]; then
+        output_lines+=("$(label_line "SKIP" "$C_YELLOW" "branch '$branch' is behind origin/$branch but working tree has local changes")")
+        continue
+      fi
+
+      if ! git -C "$repo" merge --ff-only --quiet "$origin_ref" >/dev/null 2>&1; then
+        output_lines+=("$(label_line "SKIP" "$C_YELLOW" "could not fast-forward branch '$branch' from origin/$branch")")
+        continue
+      fi
+    else
+      if ! git -C "$repo" update-ref "$local_ref" "$new_sha" >/dev/null 2>&1; then
+        output_lines+=("$(label_line "SKIP" "$C_YELLOW" "could not fast-forward branch '$branch' from origin/$branch")")
+        continue
+      fi
+    fi
+
+    output_lines+=("$(label_line "UPDATED" "$C_GREEN" "branch '$branch' from origin/$branch ${old_sha:0:12}..${new_sha:0:12}")")
+
+    local line
+    local color_flag="--no-color"
+    (( COLOR_ENABLED == 1 )) && color_flag="--color=always"
+
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      output_lines+=("$(indented_label_line "commit" "$C_CYAN" "$line")")
+    done < <(
+      git -C "$repo" log "$color_flag" --oneline --no-decorate "$old_sha..$new_sha" 2>/dev/null
+    )
+
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      output_lines+=("$(indented_label_line "files" "$C_CYAN" "$line")")
+    done < <(
+      git -C "$repo" diff "$color_flag" --stat "$old_sha" "$new_sha" 2>/dev/null
+    )
+  done < <(
+    git -C "$repo" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+  )
+
+  print_block "$repo" "${output_lines[@]}"
+}
+
+cmd_status_repo() {
+  local repo="$1"
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local -a raw_status_lines=()
+  local -a output_lines=()
+  local -a branch_diff_lines=()
+
+  local should_print=0
+  local branch_diff_found=0
+
+  local line
+  while IFS= read -r line; do
+    raw_status_lines+=("$line")
+
+    # With --branch, the first line starts with "##".
+    # Any other line means local working-tree/index/untracked changes.
+    if [[ "$line" != "## "* ]]; then
+      should_print=1
+    fi
+  done < <(
+    git -C "$repo" -c color.status=never status --short --branch --untracked-files=normal 2>/dev/null
+  )
+
+  if (( COLOR_ENABLED == 1 )); then
+    while IFS= read -r line; do
+      output_lines+=("$line")
+    done < <(
+      git -C "$repo" -c color.status=always status --short --branch --untracked-files=normal 2>/dev/null
+    )
+  else
+    output_lines=("${raw_status_lines[@]}")
+  fi
+
+  local current_branch
+  current_branch="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+  local branch_line="${raw_status_lines[0]:-}"
+
+  local has_origin_remote=0
+  if git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    has_origin_remote=1
+  fi
+
+  # Compare every local branch with origin/<same-branch>, without checking it out.
+  while IFS=$'\t' read -r branch local_sha; do
+    [[ -z "$branch" ]] && continue
+    [[ -z "$local_sha" ]] && continue
+
+    local origin_ref="refs/remotes/origin/$branch"
+    local origin_name="origin/$branch"
+
+    local origin_sha
+    origin_sha="$(git -C "$repo" rev-parse --verify --quiet "$origin_ref^{commit}" 2>/dev/null || true)"
+
+    if [[ -z "$origin_sha" ]]; then
+      if (( has_origin_remote == 1 )); then
+        branch_diff_found=1
+        branch_diff_lines+=("$(label_line "BRANCH" "$C_YELLOW" "local branch '$branch' exists locally but not on origin")")
+      fi
+      continue
+    fi
+
+    # Fast path: branches are identical, no expensive graph walk needed.
+    if [[ "$local_sha" == "$origin_sha" ]]; then
+      continue
+    fi
+
+    local ahead behind
+    read -r ahead behind < <(
+      git -C "$repo" rev-list --left-right --count "refs/heads/$branch...$origin_ref" 2>/dev/null \
+        || printf '0 0\n'
+    )
+
+    if (( ahead == 0 && behind == 0 )); then
+      continue
+    fi
+
+    branch_diff_found=1
+
+    # If this is the current branch and `git status --short --branch`
+    # already shows the ahead/behind info against origin/<branch>,
+    # do not duplicate that line.
+    if [[ "$branch" == "$current_branch" ]] &&
+       [[ "$branch_line" == *"...$origin_name"* ]] &&
+       [[ "$branch_line" == *"["*"]"* ]]; then
+      continue
+    fi
+
+    if (( ahead > 0 && behind > 0 )); then
+      branch_diff_lines+=("$(label_line "BRANCH" "$C_YELLOW" "'$branch' has $ahead local commit(s) not on $origin_name and is $behind commit(s) behind")")
+    elif (( ahead > 0 )); then
+      branch_diff_lines+=("$(label_line "BRANCH" "$C_YELLOW" "'$branch' has $ahead local commit(s) not on $origin_name")")
+    elif (( behind > 0 )); then
+      branch_diff_lines+=("$(label_line "BRANCH" "$C_YELLOW" "'$branch' is $behind commit(s) behind $origin_name")")
+    fi
+  done < <(
+    git -C "$repo" for-each-ref --format='%(refname:short)%09%(objectname)' refs/heads 2>/dev/null
+  )
+
+  if (( branch_diff_found == 1 )); then
+    should_print=1
+  fi
+
+  if (( ${#branch_diff_lines[@]} > 0 )); then
+    output_lines+=("${branch_diff_lines[@]}")
+  fi
+
+  if (( should_print == 0 )); then
+    return
+  fi
+
+  print_block "$repo" "${output_lines[@]}"
+}
+
+cmd_branch_status_repo() {
+  local repo="$1"
+  local -a output_lines=()
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local default_ref
+  default_ref="$(detect_existing_origin_default_ref "$repo" || true)"
+
+  # If we cannot determine the origin default branch, stay silent.
+  if [[ -z "$default_ref" ]]; then
+    return
+  fi
+
+  local branch
+
+  while IFS= read -r branch; do
+    [[ -z "$branch" ]] && continue
+    [[ "$branch" == "origin/HEAD" ]] && continue
+    [[ "$branch" == "$default_ref" ]] && continue
+
+    local default_sha branch_sha
+    default_sha="$(git -C "$repo" rev-parse "$default_ref^{commit}" 2>/dev/null || true)"
+    branch_sha="$(git -C "$repo" rev-parse "$branch^{commit}" 2>/dev/null || true)"
+
+    [[ -z "$default_sha" || -z "$branch_sha" ]] && continue
+    [[ "$default_sha" == "$branch_sha" ]] && continue
+
+    local default_ahead branch_ahead
+    read -r default_ahead branch_ahead < <(
+      git -C "$repo" rev-list --left-right --count "$default_ref...$branch" 2>/dev/null \
+        || printf '0 0\n'
+    )
+
+    local tree_note
+    if git -C "$repo" diff --quiet "$default_ref" "$branch" -- >/dev/null 2>&1; then
+      tree_note="same files"
+    else
+      tree_note="files differ"
+    fi
+
+    output_lines+=("$(branch_status_line "$default_ref" "$branch" "$default_ahead" "$branch_ahead" "$tree_note")")
+  done < <(
+    git -C "$repo" for-each-ref --sort=refname --format='%(refname:short)' refs/remotes/origin 2>/dev/null
+  )
+
+  print_block "$repo" "${output_lines[@]}"
+}
+
+cmd_diff_repo() {
+  local repo="$1"
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local has_staged=0
+  local has_unstaged=0
+
+  if ! git -C "$repo" diff --cached --quiet --exit-code -- >/dev/null 2>&1; then
+    has_staged=1
+  fi
+
+  if ! git -C "$repo" diff --quiet --exit-code -- >/dev/null 2>&1; then
+    has_unstaged=1
+  fi
+
+  if (( has_staged == 0 && has_unstaged == 0 )); then
+    return
+  fi
+
+  local -a output_lines=()
+  local line
+
+  if (( has_staged == 1 )); then
+    output_lines+=("$(label_line "DIFF" "$C_CYAN" "staged changes")")
+    if (( COLOR_ENABLED == 1 )); then
+      while IFS= read -r line; do
+        output_lines+=("$line")
+      done < <(
+        git -C "$repo" diff --cached --color=always --no-ext-diff --src-prefix="a/" --dst-prefix="b/" -- 2>/dev/null
+      )
+    else
+      while IFS= read -r line; do
+        output_lines+=("$line")
+      done < <(
+        git -C "$repo" diff --cached --no-color --no-ext-diff --src-prefix="a/" --dst-prefix="b/" -- 2>/dev/null
+      )
+    fi
+  fi
+
+  if (( has_unstaged == 1 )); then
+    if (( ${#output_lines[@]} > 0 )); then
+      output_lines+=("")
+    fi
+
+    output_lines+=("$(label_line "DIFF" "$C_CYAN" "unstaged changes")")
+    if (( COLOR_ENABLED == 1 )); then
+      while IFS= read -r line; do
+        output_lines+=("$line")
+      done < <(
+        git -C "$repo" diff --color=always --no-ext-diff --src-prefix="a/" --dst-prefix="b/" -- 2>/dev/null
+      )
+    else
+      while IFS= read -r line; do
+        output_lines+=("$line")
+      done < <(
+        git -C "$repo" diff --no-color --no-ext-diff --src-prefix="a/" --dst-prefix="b/" -- 2>/dev/null
+      )
+    fi
+  fi
+
+  print_block "$repo" "${output_lines[@]}"
+}
+
+cmd_branch_diff_repo() {
+  local repo="$1"
+  local -a output_lines=()
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local default_ref
+  default_ref="$(detect_existing_origin_default_ref "$repo" || true)"
+
+  if [[ -z "$default_ref" ]]; then
+    return
+  fi
+
+  local branch
+
+  while IFS= read -r branch; do
+    [[ -z "$branch" ]] && continue
+    [[ "$branch" == "origin/HEAD" ]] && continue
+    [[ "$branch" == "$default_ref" ]] && continue
+
+    local default_sha branch_sha
+    default_sha="$(git -C "$repo" rev-parse "$default_ref^{commit}" 2>/dev/null || true)"
+    branch_sha="$(git -C "$repo" rev-parse "$branch^{commit}" 2>/dev/null || true)"
+
+    [[ -z "$default_sha" || -z "$branch_sha" ]] && continue
+    [[ "$default_sha" == "$branch_sha" ]] && continue
+
+    local default_ahead branch_ahead
+    read -r default_ahead branch_ahead < <(
+      git -C "$repo" rev-list --left-right --count "$default_ref...$branch" 2>/dev/null \
+        || printf '0 0\n'
+    )
+
+    (( default_ahead == 0 && branch_ahead == 0 )) && continue
+
+    if git -C "$repo" diff --quiet "$default_ref" "$branch" -- >/dev/null 2>&1; then
+      continue
+    fi
+
+    output_lines+=("$(branch_status_line "$default_ref" "$branch" "$default_ahead" "$branch_ahead" "files differ")")
+
+    local color_flag="--no-color"
+    (( COLOR_ENABLED == 1 )) && color_flag="--color=always"
+
+    local line
+    while IFS= read -r line; do
+      output_lines+=("$line")
+    done < <(
+      git -C "$repo" diff "$color_flag" --no-ext-diff \
+        --src-prefix="a/" --dst-prefix="b/" \
+        "$default_ref" "$branch" -- 2>/dev/null
+    )
+  done < <(
+    git -C "$repo" for-each-ref --sort=refname --format='%(refname:short)' refs/remotes/origin 2>/dev/null
+  )
+
+  print_block "$repo" "${output_lines[@]}"
+}
+
+case "$COMMAND" in
+  list)
+    for_each_repo cmd_list_repo
+    ;;
+  update)
+    for_each_repo cmd_update_repo
+    ;;
+  status)
+    for_each_repo cmd_status_repo
+    ;;
+  branch-status)
+    for_each_repo cmd_branch_status_repo
+    ;;
+  diff)
+    for_each_repo cmd_diff_repo
+    ;;
+  branch-diff)
+    for_each_repo cmd_branch_diff_repo
+    ;;
+esac
