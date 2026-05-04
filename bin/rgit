@@ -53,9 +53,10 @@ Commands:
     This can be used to recreate the same repo directory structure.
 
   list-diff, ld FILE
-    Print a unified diff patch that updates FILE to match the repos currently
+    Generate a diff patch that updates FILE to match the repos currently
     found under the given dir(s). FILE must have the same format as list/ls
-    output (but the line order does not matter).
+    output, but the line order and comments in FILE (lines starting with #)
+    are ignored.
 
   update, up
     Fetch origin, including all remote branches, and safely fast-forward
@@ -671,17 +672,25 @@ cmd_list_diff() {
   fi
 
   # Build an order-insensitive but patch-applicable target file:
-  #   - keep lines that exist in both FILE and the current repo list, preserving
-  #     their order from FILE
-  #   - drop lines from FILE that no longer exist in the current repo list
+  #   - preserve comment lines from FILE unchanged
+  #   - keep repo lines that exist in both FILE and the current repo list,
+  #     preserving their order from FILE
+  #   - drop repo lines from FILE that no longer exist in the current repo list
   #   - append new current repo lines that were not present in FILE
   #
-  # Therefore, if FILE and the current repo list contain the same lines in a
-  # different order, target_file will be identical to FILE and no diff is shown.
+  # Therefore:
+  #   - if FILE and the current repo list contain the same repo lines in a
+  #     different order, target_file will be identical to FILE and no diff is shown
+  #   - comments are ignored for comparison and are not removed
   if ! awk '
     NR == FNR {
       current[$0] = 1
       current_order[++current_count] = $0
+      next
+    }
+
+    /^#/ {
+      print
       next
     }
 
@@ -719,8 +728,8 @@ cmd_list_diff() {
 
   case "$diff_rc" in
     0)
-      # No differences other than possibly line order. Stay silent, like the
-      # other commands.
+      # No differences other than possibly repo line order. Stay silent, like
+      # the other commands.
       rm -f "$current_file" "$target_file" "$patch_file"
       return 0
       ;;
