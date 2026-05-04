@@ -55,7 +55,7 @@ Commands:
   list-diff, ld FILE
     Print a unified diff patch that updates FILE to match the repos currently
     found under the given dir(s). FILE must have the same format as list/ls
-    output.
+    output (but the line order does not matter).
 
   update, up
     Fetch origin, including all remote branches, and safely fast-forward
@@ -588,6 +588,23 @@ detect_existing_origin_default_ref() {
   return 1
 }
 
+make_clone_line() {
+  local repo="$1"
+
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local origin_url
+  origin_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+
+  if [[ -z "$origin_url" ]]; then
+    return 2
+  fi
+
+  printf 'git clone -- %q %q\n' "$origin_url" "$repo"
+}
+
 write_current_list_file() {
   local output_file="$1"
   local repo
@@ -634,17 +651,58 @@ cmd_list_repo() {
 cmd_list_diff() {
   local file="$1"
   local current_file=""
+  local target_file=""
   local patch_file=""
   local diff_rc=0
 
   current_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-current.XXXXXX")" || return 1
-  patch_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-patch.XXXXXX")" || {
+  target_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-target.XXXXXX")" || {
     rm -f "$current_file"
+    return 1
+  }
+  patch_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-patch.XXXXXX")" || {
+    rm -f "$current_file" "$target_file"
     return 1
   }
 
   if ! write_current_list_file "$current_file"; then
-    rm -f "$current_file" "$patch_file"
+    rm -f "$current_file" "$target_file" "$patch_file"
+    return 1
+  fi
+
+  # Build an order-insensitive but patch-applicable target file:
+  #   - keep lines that exist in both FILE and the current repo list, preserving
+  #     their order from FILE
+  #   - drop lines from FILE that no longer exist in the current repo list
+  #   - append new current repo lines that were not present in FILE
+  #
+  # Therefore, if FILE and the current repo list contain the same lines in a
+  # different order, target_file will be identical to FILE and no diff is shown.
+  if ! awk '
+    NR == FNR {
+      current[$0] = 1
+      current_order[++current_count] = $0
+      next
+    }
+
+    {
+      old[$0] = 1
+      if ($0 in current) {
+        print
+      }
+    }
+
+    END {
+      for (i = 1; i <= current_count; i++) {
+        line = current_order[i]
+        if (!(line in old)) {
+          print line
+        }
+      }
+    }
+  ' "$current_file" "$file" > "$target_file"; then
+    printf 'list-diff: failed to build comparison target for %s\n' "$file" >&2
+    rm -f "$current_file" "$target_file" "$patch_file"
     return 1
   fi
 
@@ -656,13 +714,14 @@ cmd_list_diff() {
     diff_args=("--color=always" "-u")
   fi
 
-  diff "${diff_args[@]}" "$file" "$current_file" > "$patch_file"
+  diff "${diff_args[@]}" "$file" "$target_file" > "$patch_file"
   diff_rc=$?
 
   case "$diff_rc" in
     0)
-      # No differences. Stay silent, like the other commands.
-      rm -f "$current_file" "$patch_file"
+      # No differences other than possibly line order. Stay silent, like the
+      # other commands.
+      rm -f "$current_file" "$target_file" "$patch_file"
       return 0
       ;;
     1)
@@ -684,12 +743,12 @@ cmd_list_diff() {
         cat
       } < "$patch_file"
 
-      rm -f "$current_file" "$patch_file"
+      rm -f "$current_file" "$target_file" "$patch_file"
       return 0
       ;;
     *)
       printf 'list-diff: diff failed comparing %s\n' "$file" >&2
-      rm -f "$current_file" "$patch_file"
+      rm -f "$current_file" "$target_file" "$patch_file"
       return "$diff_rc"
       ;;
   esac
