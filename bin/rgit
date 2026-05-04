@@ -52,6 +52,11 @@ Commands:
     List all repos as git clone commands.
     This can be used to recreate the same repo directory structure.
 
+  list-diff, ld FILE
+    Print a unified diff patch that updates FILE to match the repos currently
+    found under the given dir(s). FILE must have the same format as list/ls
+    output.
+
   update, up
     Fetch origin, including all remote branches, and safely fast-forward
     local branches where possible.
@@ -87,6 +92,7 @@ Commands:
 
 Examples:
    $SCRIPT_NAME ls ~/all-repos > ~/git-repos-\$(date +%F).sh
+   $SCRIPT_NAME ld ~/git-repos-2025-01-01.sh ~/all-repos
    $SCRIPT_NAME up
    $SCRIPT_NAME -v up
    $SCRIPT_NAME -j 8 --fetch-timeout 30 up repos/*
@@ -238,6 +244,9 @@ case "$COMMAND" in
   list|ls)
     COMMAND="list"
     ;;
+  list-diff|ld)
+    COMMAND="list-diff"
+    ;;
   update|up)
     COMMAND="update"
     ;;
@@ -281,6 +290,23 @@ if command -v timeout >/dev/null 2>&1; then
   TIMEOUT_BIN="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
+fi
+
+if [[ "$COMMAND" == "list-diff" ]]; then
+  if (( $# < 1 )); then
+    echo "Missing FILE argument for list-diff/ld" >&2
+    echo >&2
+    print_help >&2
+    exit 2
+  fi
+
+  LIST_DIFF_FILE="$1"
+  shift
+
+  if [[ ! -r "$LIST_DIFF_FILE" ]]; then
+    echo "Cannot read list-diff file: $LIST_DIFF_FILE" >&2
+    exit 2
+  fi
 fi
 
 if (( $# == 0 )); then
@@ -562,22 +588,111 @@ detect_existing_origin_default_ref() {
   return 1
 }
 
+write_current_list_file() {
+  local output_file="$1"
+  local repo
+  local line
+  local rc
+
+  collect_repos
+
+  : > "$output_file" || return 1
+
+  for repo in "${REPOS[@]}"; do
+    line="$(make_clone_line "$repo")"
+    rc=$?
+
+    case "$rc" in
+      0)
+        printf '%s\n' "$line" >> "$output_file"
+        ;;
+      2)
+        printf 'Skipping %s: no origin remote configured\n' "$repo" >&2
+        ;;
+    esac
+  done
+}
+
 cmd_list_repo() {
   local repo="$1"
+  local line
+  local rc
 
-  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    return
+  line="$(make_clone_line "$repo")"
+  rc=$?
+
+  case "$rc" in
+    0)
+      printf '%s\n' "$line"
+      ;;
+    2)
+      printf 'Skipping %s: no origin remote configured\n' "$repo" >&2
+      ;;
+  esac
+}
+
+cmd_list_diff() {
+  local file="$1"
+  local current_file=""
+  local patch_file=""
+  local diff_rc=0
+
+  current_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-current.XXXXXX")" || return 1
+  patch_file="$(mktemp "${TMPDIR:-/tmp}/git-repos-patch.XXXXXX")" || {
+    rm -f "$current_file"
+    return 1
+  }
+
+  if ! write_current_list_file "$current_file"; then
+    rm -f "$current_file" "$patch_file"
+    return 1
   fi
 
-  local origin_url
-  origin_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+  local -a diff_args=("-u")
 
-  if [[ -z "$origin_url" ]]; then
-    printf 'Skipping %s: no origin remote configured\n' "$repo" >&2
-    return
+  # GNU diff supports --color. BSD/macOS diff usually does not.
+  # Only colorize when stdout is a terminal, so redirected output remains a valid patch.
+  if (( COLOR_ENABLED == 1 )) && diff --color=always -u /dev/null /dev/null >/dev/null 2>&1; then
+    diff_args=("--color=always" "-u")
   fi
 
-  printf 'git clone -- %q %q\n' "$origin_url" "$repo"
+  diff "${diff_args[@]}" "$file" "$current_file" > "$patch_file"
+  diff_rc=$?
+
+  case "$diff_rc" in
+    0)
+      # No differences. Stay silent, like the other commands.
+      rm -f "$current_file" "$patch_file"
+      return 0
+      ;;
+    1)
+      # Differences found. Rewrite the diff headers so the patch targets FILE,
+      # not the temporary generated file.
+      {
+        # Discard original --- and +++ headers.
+        IFS= read -r _old_header || true
+        IFS= read -r _new_header || true
+
+        if (( COLOR_ENABLED == 1 )); then
+          printf -- '%s--- %s%s\n' "$C_RED" "$file" "$C_RESET"
+          printf -- '%s+++ %s%s\n' "$C_GREEN" "$file" "$C_RESET"
+        else
+          printf -- '--- %s\n' "$file"
+          printf -- '+++ %s\n' "$file"
+        fi
+
+        cat
+      } < "$patch_file"
+
+      rm -f "$current_file" "$patch_file"
+      return 0
+      ;;
+    *)
+      printf 'list-diff: diff failed comparing %s\n' "$file" >&2
+      rm -f "$current_file" "$patch_file"
+      return "$diff_rc"
+      ;;
+  esac
 }
 
 cmd_update_repo() {
@@ -988,6 +1103,9 @@ cmd_branch_diff_repo() {
 case "$COMMAND" in
   list)
     for_each_repo cmd_list_repo
+    ;;
+  list-diff)
+    cmd_list_diff "$LIST_DIFF_FILE"
     ;;
   update)
     for_each_repo cmd_update_repo
