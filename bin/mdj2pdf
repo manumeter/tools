@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+
+import argparse, os, sys, re, yaml, jinja2, subprocess, datetime
+
+# Arguments
+
+desc = '''
+Convert a jinja2 templated markdown file into a PDF. Use the YAML metadata block
+(https://pandoc.org/MANUAL.html#extension-yaml_metadata_block) to add variables
+for templating.
+'''
+
+parser = argparse.ArgumentParser(description=desc)
+parser.add_argument('file', help='jinja2 templated markdown file with yaml metadata block')
+args = parser.parse_args()
+
+# Read file
+
+try:
+    with open(args.file) as f:
+        md = f.read()
+except IOError as e:
+    print(str(e), file=sys.stderr)
+    exit(1)
+
+# Parse YAML
+
+now = datetime.datetime.now()
+
+data = {
+    'file': {
+        'path': os.path.abspath(os.path.dirname(args.file)),
+        'md': os.path.basename(args.file),
+        'pdf': '%s.pdf' % os.path.splitext(os.path.basename(args.file))[0],
+    },
+    'now': {
+        'year': now.year,
+        'month': now.month,
+        'day': now.day,
+        'hour': now.hour,
+        'minute': now.minute,
+        'second': now.second,
+    }
+}
+
+for yml in re.findall(r'(\A|^$\n)^---$\n(.*?)^(---|\.\.\.)$', md, re.MULTILINE+re.DOTALL):
+    try:
+        data.update(yaml.safe_load(yml[1]))
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        exit(1)
+
+# Parse Jinja2
+
+try:
+    j2 = jinja2.Environment(loader=jinja2.FileSystemLoader(data['file']['path']), undefined=jinja2.StrictUndefined, trim_blocks=True)
+    # read file again (instead of string in var "md") to have a better trace on errors in jinja2
+    doc = j2.get_template(data['file']['md']).render(data)
+except Exception as e:
+    import traceback
+    print('%s:\n%s' % (str(e), traceback.format_exc()), file=sys.stderr)
+    exit(1)
+
+# Pass to pandoc
+
+try:
+    with open('/tmp/pandoc-preamble.tex', 'w') as fp:
+        fp.write('''
+            \\usepackage{fontspec}
+            \\directlua{luaotfload.add_fallback
+               ("emojifallback",
+                {
+                  "NotoColorEmoji:mode=harf;"
+                }
+               )}
+            
+            \\setmainfont{lmroman10-regular}[
+              Extension      = .otf,
+              BoldFont       = lmroman10-bold,
+              ItalicFont     = lmroman10-italic,
+              BoldItalicFont = lmroman10-bolditalic,
+              RawFeature={fallback=emojifallback}
+            ]
+        ''')
+    with subprocess.Popen(['pandoc', '-f', 'markdown', '-t', 'latex', '--pdf-engine=lualatex', '-H', '/tmp/pandoc-preamble.tex', '-s', '-o', data['file']['pdf']], stdin=subprocess.PIPE) as p:
+        p.stdin.write(str.encode(doc))
+except Exception as e:
+    print(str(e), file=sys.stderr)
+    exit(1)
+
+exit(p.returncode)

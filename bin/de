@@ -1,0 +1,57 @@
+#!/usr/bin/python3
+
+from lxml import html
+import argparse, sys, requests
+
+# colorization
+
+if sys.stdout.isatty():
+	normal = '\033[00m'
+	green = '\033[92m'
+	blue = '\033[94m'
+else:
+	normal = ''
+	green = ''
+	blue = ''
+
+# arguments
+
+subargs = {};
+langs = {
+	'en':'englisch',
+	'fr':'franz%C3%B6sisch',
+	'es':'spanisch',
+	'it':'italienisch',
+	'ch':'chinesisch',
+	'ru':'russisch',
+	'pt':'portugiesisch',
+	'pl':'polnisch'
+}
+
+parser = argparse.ArgumentParser(description='Translate a word from or to german with dict.leo.org.')
+parser.add_argument('lang', choices=langs.keys(), help='language to translate from or to german')
+parser.add_argument('word', help='word(s) to translate')
+
+args = parser.parse_args()
+
+# call
+
+url = 'https://dict.leo.org/%s-deutsch/%s' % (langs[args.lang], args.word);
+
+r = requests.get(url)
+if r.status_code == 200:
+	content = html.fromstring(r.content)
+	for section in content.xpath('//*[@data-dz-role="section"]/@data-dz-name'):
+		print(content.xpath('//*[@data-dz-name="%s"]//h2/text()' % section)[0])
+		for entry in content.xpath('//*[@data-dz-name="%s"]//*[@data-dz-ui="dictentry"]/@data-dz-rel-uid' % section):
+			ol = ' '.join(content.xpath('//*[@data-dz-name="%s"]//*[@data-dz-rel-uid="%s"]//*[@lang="%s"]//text()' % (section, entry, args.lang)))
+			de = ' '.join(content.xpath('//*[@data-dz-name="%s"]//*[@data-dz-rel-uid="%s"]//*[@lang="de"]//text()' % (section, entry)))
+			ol = ' '.join(ol.split())
+			de = ' '.join(de.split())
+			print('  %s%s%s%s -- %s%s%s' % (green, ol, normal, ' ' * (30 - len(ol)), blue, de, normal))
+elif r.status_code == 404:
+	print('Error: %s not found' % args.word, file=sys.stderr)
+	sys.exit(1)
+else:
+	print('Error: dict.leo.org returned status code %i' % r.status_code, file=sys.stderr)
+	sys.exit(1)
