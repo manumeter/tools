@@ -795,9 +795,48 @@ cmd_update_repo() {
   local current_branch
   current_branch="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 
-  while IFS= read -r branch; do
-    [[ -z "$branch" ]] && continue
+  # Determine the default branch so it is processed first; this lets us suppress
+  # the per-branch files list for branches whose new commits were already shown
+  # under the default branch in the same repo.
+  local default_branch=""
+  local default_ref_full
+  default_ref_full="$(detect_existing_origin_default_ref "$repo" || true)"
+  if [[ -n "$default_ref_full" ]]; then
+    default_branch="${default_ref_full#origin/}"
+  fi
 
+  local -a branches=()
+  local b
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    branches+=("$b")
+  done < <(
+    git -C "$repo" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+  )
+
+  if [[ -n "$default_branch" ]]; then
+    local default_present=0
+    for b in "${branches[@]}"; do
+      if [[ "$b" == "$default_branch" ]]; then
+        default_present=1
+        break
+      fi
+    done
+    if (( default_present == 1 )); then
+      local -a reordered=("$default_branch")
+      for b in "${branches[@]}"; do
+        [[ "$b" == "$default_branch" ]] && continue
+        reordered+=("$b")
+      done
+      branches=("${reordered[@]}")
+    fi
+  fi
+
+  # Per-repo set of commit SHAs whose files have already been listed.
+  local -a printed_commits=()
+  local branch
+
+  for branch in "${branches[@]}"; do
     local local_ref="refs/heads/$branch"
     local origin_ref="refs/remotes/origin/$branch"
 
@@ -859,15 +898,50 @@ cmd_update_repo() {
       git -C "$repo" log "$color_flag" --oneline --no-decorate "$old_sha..$new_sha" 2>/dev/null
     )
 
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      output_lines+=("$(indented_label_line "files" "$C_CYAN" "$line")")
+    # Skip the files block when every commit in this range was already shown
+    # under an earlier (default) branch in this repo.
+    local -a range_commits=()
+    local sha
+    while IFS= read -r sha; do
+      [[ -z "$sha" ]] && continue
+      range_commits+=("$sha")
     done < <(
-      git -C "$repo" diff "$color_flag" --stat "$old_sha" "$new_sha" 2>/dev/null
+      git -C "$repo" rev-list "$old_sha..$new_sha" 2>/dev/null
     )
-  done < <(
-    git -C "$repo" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
-  )
+
+    local all_seen=1
+    if (( ${#range_commits[@]} == 0 )); then
+      all_seen=0
+    else
+      for sha in "${range_commits[@]}"; do
+        local seen=0
+        local p
+        for p in "${printed_commits[@]}"; do
+          if [[ "$p" == "$sha" ]]; then
+            seen=1
+            break
+          fi
+        done
+        if (( seen == 0 )); then
+          all_seen=0
+          break
+        fi
+      done
+    fi
+
+    if (( all_seen == 0 )); then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        output_lines+=("$(indented_label_line "files" "$C_CYAN" "$line")")
+      done < <(
+        git -C "$repo" diff "$color_flag" --stat "$old_sha" "$new_sha" 2>/dev/null
+      )
+
+      for sha in "${range_commits[@]}"; do
+        printed_commits+=("$sha")
+      done
+    fi
+  done
 
   print_block "$repo" "${output_lines[@]}"
 }
