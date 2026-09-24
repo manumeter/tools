@@ -79,7 +79,7 @@ fqhn="$host"
 # Process
 #
 
-[ 0 -eq $2 ] && { nc -zw3 $host 22 || { echo >&2 "Host $host:22 is not reachable!"; exit 1; } }
+[ 0 -eq $2 ] && { nc -zw3 $host 22 || { echo >&2 "Host $host:22 is not reachable!"; exit 1; }; }
 
 for h in "$ip"; do ssh-keygen -R $h -f ~/.ssh/known_hosts; done
 for h in "$fqhn"; do ssh-keygen -R $h -f ~/.ssh/known_hosts; done
