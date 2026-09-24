@@ -19,9 +19,9 @@ Description:
   - all fully qualified host names (DNS PTR records)
   - the unqualified host names (from the above)
  
-  It will then remove/update all entries from this list. But before
-  doing anything, it checks if the host is reachable on port 22 (except
-  if -d or --delete is used).
+  It will then remove all entries from this list and only add the given
+  name/ip. But before doing anything, it checks if the host is reachable
+  on port 22 (except if -d or --delete is used).
 
   The user part of the string will always be ignored (this is only for
   convenience to allow copy-paste from the ssh command).
@@ -79,14 +79,11 @@ fqhn="$host"
 # Process
 #
 
-delup() {
-    [ 0 -eq $2 ] && { nc -zw3 $1 22 || return; }
-    ssh-keygen -R $1 -f ~/.ssh/known_hosts
-    [ 0 -eq $2 ] && ssh-keyscan $1 >> ~/.ssh/known_hosts
-}
+[ 0 -eq $2 ] && { nc -zw3 $host 22 || { echo >&2 "Host $host:22 is not reachable!"; exit 1; } }
 
-for h in "$ip"; do delup $h $delete; done
-for h in "$fqhn"; do delup $h $delete; done
-for h in "$fqhn"; do delup ${h%%.*} $delete; done
+for h in "$ip"; do ssh-keygen -R $h -f ~/.ssh/known_hosts; done
+for h in "$fqhn"; do ssh-keygen -R $h -f ~/.ssh/known_hosts; done
+for h in "$fqhn"; do ssh-keygen -R ${h%%.*} -f ~/.ssh/known_hosts; done
 
+[ 0 -eq $delete ] && ssh-keyscan $host >> ~/.ssh/known_hosts
 [ 0 -eq $delete ] && ssh $1
