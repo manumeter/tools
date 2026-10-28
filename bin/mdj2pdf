@@ -82,7 +82,7 @@ try:
               RawFeature={fallback=emojifallback}
             ]
         ''')
-    with subprocess.Popen(['pandoc', '-f', 'markdown', '-t', 'latex', '--pdf-engine=lualatex', '-H', '/tmp/pandoc-preamble.tex', '-s', '-o', data['file']['pdf']], stdin=subprocess.PIPE) as p:
+    with subprocess.Popen(['pandoc', '-f', 'markdown', '--columns=1000', '-t', 'latex', '--pdf-engine=lualatex', '-H', '/tmp/pandoc-preamble.tex', '-s', '-o', data['file']['pdf']], stdin=subprocess.PIPE) as p:
         p.stdin.write(str.encode(doc))
 except Exception as e:
     print(str(e), file=sys.stderr)
